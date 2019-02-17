@@ -4,6 +4,9 @@ waylandPkgs = rec {
   # temp
   scdoc-1_8        = pkgs.callPackage ./pkgs-temp/scdoc {};
 
+  # experimental
+  sommelier        = pkgs.callPackage ./pkgs/sommelier {};
+
   # wlroots-related
   wlroots          = pkgs.callPackage ./pkgs/wlroots {};
   sway-beta        = pkgs.callPackage ./pkgs/sway-beta { scdoc = scdoc-1_8; };
