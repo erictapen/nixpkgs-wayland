@@ -1,0 +1,1696 @@
+From e5d67d741d7a3b3aa0ce404ca54aad596f3d5919 Mon Sep 17 00:00:00 2001
+From: emersion <contact@emersion.fr>
+Date: Fri, 29 Mar 2019 21:27:12 +0200
+Subject: [PATCH 01/16] backend/drm: add basic support for direct scan-out
+
+---
+ backend/drm/drm.c                   | 47 +++++++++++++++++++++++++++++
+ backend/drm/renderer.c              | 24 +++++++++++++++
+ backend/drm/util.c                  | 11 +++----
+ include/backend/drm/renderer.h      |  2 ++
+ include/wlr/interfaces/wlr_output.h |  2 ++
+ include/wlr/types/wlr_output.h      |  2 ++
+ types/wlr_output.c                  | 24 +++++++++++++++
+ 7 files changed, 105 insertions(+), 7 deletions(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 17a2e48db..2e9ce589e 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -820,6 +820,52 @@ static bool drm_connector_schedule_frame(struct wlr_output *output) {
+ 	return true;
+ }
+ 
++static bool drm_connector_set_dmabuf(struct wlr_output *output,
++		struct wlr_dmabuf_attributes *attribs) {
++	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
++	struct wlr_drm_backend *drm = get_drm_backend_from_backend(output->backend);
++	if (!drm->session->active) {
++		return false;
++	}
++
++	struct wlr_drm_crtc *crtc = conn->crtc;
++	if (!crtc) {
++		return false;
++	}
++
++	// TODO: check plane input formats
++
++	if (attribs->width != output->width || attribs->height != output->height) {
++		return false;
++	}
++
++	struct gbm_bo *bo = import_gbm_bo(&drm->renderer, attribs);
++	if (bo == NULL) {
++		wlr_log(WLR_ERROR, "import_gbm_bo failed");
++		return NULL;
++	}
++
++	uint32_t fb_id = get_fb_for_bo(bo, gbm_bo_get_format(bo));
++	if (fb_id == 0) {
++		wlr_log(WLR_ERROR, "get_fb_for_bo failed");
++		return false;
++	}
++
++	if (conn->pageflip_pending) {
++		wlr_log(WLR_ERROR, "Skipping pageflip on output '%s'", conn->output.name);
++		return false;
++	}
++
++	if (!drm->iface->crtc_pageflip(drm, conn, crtc, fb_id, NULL)) {
++		wlr_log(WLR_ERROR, "crtc_pageflip failed");
++		return false;
++	}
++
++	conn->pageflip_pending = true;
++	wlr_output_update_enabled(output, true);
++	return true;
++}
++
+ static void drm_connector_destroy(struct wlr_output *output) {
+ 	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+ 	drm_connector_cleanup(conn);
+@@ -842,6 +888,7 @@ static const struct wlr_output_impl output_impl = {
+ 	.get_gamma_size = drm_connector_get_gamma_size,
+ 	.export_dmabuf = drm_connector_export_dmabuf,
+ 	.schedule_frame = drm_connector_schedule_frame,
++	.set_dmabuf = drm_connector_set_dmabuf,
+ };
+ 
+ bool wlr_output_is_drm(struct wlr_output *output) {
+diff --git a/backend/drm/renderer.c b/backend/drm/renderer.c
+index 1771e7256..07d1f3fc4 100644
+--- a/backend/drm/renderer.c
++++ b/backend/drm/renderer.c
+@@ -163,6 +163,30 @@ void post_drm_surface(struct wlr_drm_surface *surf) {
+ 	}
+ }
+ 
++struct gbm_bo *import_gbm_bo(struct wlr_drm_renderer *renderer,
++		struct wlr_dmabuf_attributes *attribs) {
++	struct gbm_import_fd_modifier_data data = {
++		.width = attribs->width,
++		.height = attribs->height,
++		.format = attribs->format,
++		.num_fds = attribs->n_planes,
++		.modifier = attribs->modifier,
++	};
++
++	if ((size_t)attribs->n_planes > sizeof(data.fds) / sizeof(data.fds[0])) {
++		return NULL;
++	}
++
++	for (size_t i = 0; i < (size_t)attribs->n_planes; ++i) {
++		data.fds[i] = attribs->fd[i];
++		data.strides[i] = attribs->stride[i];
++		data.offsets[i] = attribs->offset[i];
++	}
++
++	return gbm_bo_import(renderer->gbm, GBM_BO_IMPORT_FD_MODIFIER,
++		&data, GBM_BO_USE_SCANOUT);
++}
++
+ bool export_drm_bo(struct gbm_bo *bo, struct wlr_dmabuf_attributes *attribs) {
+ 	memset(attribs, 0, sizeof(struct wlr_dmabuf_attributes));
+ 
+diff --git a/backend/drm/util.c b/backend/drm/util.c
+index c2aa0fd8a..2fa948f59 100644
+--- a/backend/drm/util.c
++++ b/backend/drm/util.c
+@@ -184,21 +184,18 @@ uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format) {
+ 		return id;
+ 	}
+ 
+-	assert(gbm_bo_get_format(bo) == GBM_FORMAT_ARGB8888);
+-	assert(drm_format == DRM_FORMAT_ARGB8888 ||
+-		drm_format == DRM_FORMAT_XRGB8888);
+-
+ 	struct gbm_device *gbm = gbm_bo_get_device(bo);
+ 
+ 	int fd = gbm_device_get_fd(gbm);
+ 	uint32_t width = gbm_bo_get_width(bo);
+ 	uint32_t height = gbm_bo_get_height(bo);
+ 	uint32_t handles[4] = {gbm_bo_get_handle(bo).u32};
+-	uint32_t pitches[4] = {gbm_bo_get_stride(bo)};
++	uint32_t strides[4] = {gbm_bo_get_stride(bo)};
+ 	uint32_t offsets[4] = {gbm_bo_get_offset(bo, 0)};
++	uint64_t modifiers[4] = {gbm_bo_get_modifier(bo)};
+ 
+-	if (drmModeAddFB2(fd, width, height, drm_format,
+-			handles, pitches, offsets, &id, 0)) {
++	if (drmModeAddFB2WithModifiers(fd, width, height, drm_format,
++			handles, strides, offsets, modifiers, &id, DRM_MODE_FB_MODIFIERS)) {
+ 		wlr_log_errno(WLR_ERROR, "Unable to add DRM framebuffer");
+ 	}
+ 
+diff --git a/include/backend/drm/renderer.h b/include/backend/drm/renderer.h
+index 25b07b975..93b8da7cf 100644
+--- a/include/backend/drm/renderer.h
++++ b/include/backend/drm/renderer.h
+@@ -54,6 +54,8 @@ struct gbm_bo *get_drm_surface_front(struct wlr_drm_surface *surf);
+ void post_drm_surface(struct wlr_drm_surface *surf);
+ struct gbm_bo *copy_drm_surface_mgpu(struct wlr_drm_surface *dest,
+ 	struct gbm_bo *src);
++struct gbm_bo *import_gbm_bo(struct wlr_drm_renderer *renderer,
++	struct wlr_dmabuf_attributes *attribs);
+ bool export_drm_bo(struct gbm_bo *bo, struct wlr_dmabuf_attributes *attribs);
+ 
+ #endif
+diff --git a/include/wlr/interfaces/wlr_output.h b/include/wlr/interfaces/wlr_output.h
+index 9c6f4aa5f..a70c86e66 100644
+--- a/include/wlr/interfaces/wlr_output.h
++++ b/include/wlr/interfaces/wlr_output.h
+@@ -34,6 +34,8 @@ struct wlr_output_impl {
+ 	bool (*export_dmabuf)(struct wlr_output *output,
+ 		struct wlr_dmabuf_attributes *attribs);
+ 	bool (*schedule_frame)(struct wlr_output *output);
++	bool (*set_dmabuf)(struct wlr_output *output,
++		struct wlr_dmabuf_attributes *attribs);
+ };
+ 
+ void wlr_output_init(struct wlr_output *output, struct wlr_backend *backend,
+diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
+index 723ef4ca5..163d54ad9 100644
+--- a/include/wlr/types/wlr_output.h
++++ b/include/wlr/types/wlr_output.h
+@@ -243,6 +243,8 @@ bool wlr_output_preferred_read_format(struct wlr_output *output,
+  */
+ void wlr_output_set_damage(struct wlr_output *output,
+ 	pixman_region32_t *damage);
++bool wlr_output_set_dmabuf(struct wlr_output *output,
++	struct wlr_dmabuf_attributes *attribs);
+ /**
+  * Commit the pending output state. If `wlr_output_attach_render` has been
+  * called, the pending frame will be submitted for display.
+diff --git a/types/wlr_output.c b/types/wlr_output.c
+index 27f5c3ff9..a673f1a85 100644
+--- a/types/wlr_output.c
++++ b/types/wlr_output.c
+@@ -474,6 +474,30 @@ bool wlr_output_commit(struct wlr_output *output) {
+ 	return true;
+ }
+ 
++bool wlr_output_set_dmabuf(struct wlr_output *output,
++		struct wlr_dmabuf_attributes *attribs) {
++	if (output->frame_pending) {
++		wlr_log(WLR_ERROR, "Tried to swap buffers when a frame is pending");
++		return false;
++	}
++	if (output->idle_frame != NULL) {
++		wl_event_source_remove(output->idle_frame);
++		output->idle_frame = NULL;
++	}
++
++	if (!output->impl->set_dmabuf) {
++		return false;
++	}
++	if (!output->impl->set_dmabuf(output, attribs)) {
++		return false;
++	}
++
++	output->frame_pending = true;
++	output->needs_swap = false;
++	pixman_region32_clear(&output->damage);
++	return true;
++}
++
+ void wlr_output_send_frame(struct wlr_output *output) {
+ 	output->frame_pending = false;
+ 	wlr_signal_emit_safe(&output->events.frame, output);
+
+From 66da4fad36d60256c623d9e6991dba5fd8e4a3af Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Tue, 9 Apr 2019 23:36:35 +0300
+Subject: [PATCH 02/16] backend/drm: check format when scanning out DMA-BUF
+
+---
+ backend/drm/drm.c                   | 45 +++++++++++++++++++++++++++--
+ backend/drm/properties.c            | 39 +++++++++++++------------
+ include/backend/drm/drm.h           |  2 ++
+ include/backend/drm/properties.h    |  3 +-
+ include/wlr/render/drm_format_set.h |  3 ++
+ render/drm_format_set.c             | 20 +++++++++++++
+ 6 files changed, 90 insertions(+), 22 deletions(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 2e9ce589e..a2a117d6f 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -123,6 +123,8 @@ static bool init_planes(struct wlr_drm_backend *drm) {
+ 		uint32_t rgb_format = DRM_FORMAT_INVALID;
+ 		for (size_t j = 0; j < plane->count_formats; ++j) {
+ 			uint32_t fmt = plane->formats[j];
++			wlr_drm_format_set_add(&p->formats, fmt, DRM_FORMAT_MOD_INVALID);
++
+ 			if (fmt == DRM_FORMAT_ARGB8888) {
+ 				// Prefer formats with alpha channel
+ 				rgb_format = fmt;
+@@ -141,6 +143,38 @@ static bool init_planes(struct wlr_drm_backend *drm) {
+ 		}
+ 		p->drm_format = rgb_format;
+ 
++		if (p->props.in_formats) {
++			uint64_t blob_id;
++			if (!get_drm_prop(drm->fd, p->id, p->props.in_formats, &blob_id)) {
++				wlr_log(WLR_ERROR, "Failed to read IN_FORMATS property");
++				drmModeFreePlane(plane);
++				goto error_planes;
++			}
++
++			drmModePropertyBlobRes *blob =
++				drmModeGetPropertyBlob(drm->fd, blob_id);
++			if (!blob) {
++				wlr_log(WLR_ERROR, "Failed to read IN_FORMATS blob");
++				drmModeFreePlane(plane);
++				goto error_planes;
++			}
++
++			struct drm_format_modifier_blob *data = blob->data;
++			uint32_t *fmts = (uint32_t *)((char *)data + data->formats_offset);
++			struct drm_format_modifier *mods = (struct drm_format_modifier *)
++				((char *)data + data->modifiers_offset);
++			for (uint32_t i = 0; i < data->count_modifiers; ++i) {
++				for (int j = 0; j < 64; ++j) {
++					if (mods[i].formats & ((uint64_t)1 << j)) {
++						wlr_drm_format_set_add(&p->formats,
++							fmts[j + mods[i].offset], mods[i].modifier);
++					}
++				}
++			}
++
++			drmModeFreePropertyBlob(blob);
++		}
++
+ 		drmModeFreePlane(plane);
+ 	}
+ 
+@@ -215,6 +249,11 @@ void finish_drm_resources(struct wlr_drm_backend *drm) {
+ 		return;
+ 	}
+ 
++	for (size_t i = 0; i < drm->num_planes; ++i) {
++		struct wlr_drm_plane *p = &drm->planes[i];
++		wlr_drm_format_set_finish(&p->formats);
++	}
++
+ 	for (size_t i = 0; i < drm->num_crtcs; ++i) {
+ 		struct wlr_drm_crtc *crtc = &drm->crtcs[i];
+ 		drmModeAtomicFree(crtc->atomic);
+@@ -833,11 +872,13 @@ static bool drm_connector_set_dmabuf(struct wlr_output *output,
+ 		return false;
+ 	}
+ 
+-	// TODO: check plane input formats
+-
+ 	if (attribs->width != output->width || attribs->height != output->height) {
+ 		return false;
+ 	}
++	if (!wlr_drm_format_set_has(&crtc->primary->formats,
++			attribs->format, attribs->modifier)) {
++		return false;
++	}
+ 
+ 	struct gbm_bo *bo = import_gbm_bo(&drm->renderer, attribs);
+ 	if (bo == NULL) {
+diff --git a/backend/drm/properties.c b/backend/drm/properties.c
+index 5541d1be3..010b71d45 100644
+--- a/backend/drm/properties.c
++++ b/backend/drm/properties.c
+@@ -19,38 +19,39 @@ struct prop_info {
+ 
+ static const struct prop_info connector_info[] = {
+ #define INDEX(name) (offsetof(union wlr_drm_connector_props, name) / sizeof(uint32_t))
+-	{ "CRTC_ID",     INDEX(crtc_id) },
+-	{ "DPMS",        INDEX(dpms) },
+-	{ "EDID",        INDEX(edid) },
+-	{ "PATH",        INDEX(path) },
++	{ "CRTC_ID", INDEX(crtc_id) },
++	{ "DPMS", INDEX(dpms) },
++	{ "EDID", INDEX(edid) },
++	{ "PATH", INDEX(path) },
+ 	{ "link-status", INDEX(link_status) },
+ #undef INDEX
+ };
+ 
+ static const struct prop_info crtc_info[] = {
+ #define INDEX(name) (offsetof(union wlr_drm_crtc_props, name) / sizeof(uint32_t))
+-	{ "ACTIVE",         INDEX(active) },
+-	{ "GAMMA_LUT",      INDEX(gamma_lut) },
++	{ "ACTIVE", INDEX(active) },
++	{ "GAMMA_LUT", INDEX(gamma_lut) },
+ 	{ "GAMMA_LUT_SIZE", INDEX(gamma_lut_size) },
+-	{ "MODE_ID",        INDEX(mode_id) },
+-	{ "rotation",       INDEX(rotation) },
+-	{ "scaling mode",   INDEX(scaling_mode) },
++	{ "MODE_ID", INDEX(mode_id) },
++	{ "rotation", INDEX(rotation) },
++	{ "scaling mode", INDEX(scaling_mode) },
+ #undef INDEX
+ };
+ 
+ static const struct prop_info plane_info[] = {
+ #define INDEX(name) (offsetof(union wlr_drm_plane_props, name) / sizeof(uint32_t))
+-	{ "CRTC_H",  INDEX(crtc_h) },
++	{ "CRTC_H", INDEX(crtc_h) },
+ 	{ "CRTC_ID", INDEX(crtc_id) },
+-	{ "CRTC_W",  INDEX(crtc_w) },
+-	{ "CRTC_X",  INDEX(crtc_x) },
+-	{ "CRTC_Y",  INDEX(crtc_y) },
+-	{ "FB_ID",   INDEX(fb_id) },
+-	{ "SRC_H",   INDEX(src_h) },
+-	{ "SRC_W",   INDEX(src_w) },
+-	{ "SRC_X",   INDEX(src_x) },
+-	{ "SRC_Y",   INDEX(src_y) },
+-	{ "type",    INDEX(type) },
++	{ "CRTC_W", INDEX(crtc_w) },
++	{ "CRTC_X", INDEX(crtc_x) },
++	{ "CRTC_Y", INDEX(crtc_y) },
++	{ "FB_ID", INDEX(fb_id) },
++	{ "IN_FORMATS", INDEX(in_formats) },
++	{ "SRC_H", INDEX(src_h) },
++	{ "SRC_W", INDEX(src_w) },
++	{ "SRC_X", INDEX(src_x) },
++	{ "SRC_Y", INDEX(src_y) },
++	{ "type", INDEX(type) },
+ #undef INDEX
+ };
+ 
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index 6481f0851..ba08449af 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -11,6 +11,7 @@
+ #include <wayland-util.h>
+ #include <wlr/backend/drm.h>
+ #include <wlr/backend/session.h>
++#include <wlr/render/drm_format_set.h>
+ #include <wlr/render/egl.h>
+ #include <xf86drmMode.h>
+ #include "iface.h"
+@@ -27,6 +28,7 @@ struct wlr_drm_plane {
+ 	struct wlr_drm_surface mgpu_surf;
+ 
+ 	uint32_t drm_format; // ARGB8888 or XRGB8888
++	struct wlr_drm_format_set formats;
+ 
+ 	// Only used by cursor
+ 	float matrix[9];
+diff --git a/include/backend/drm/properties.h b/include/backend/drm/properties.h
+index b4d43bddb..28f0dbe41 100644
+--- a/include/backend/drm/properties.h
++++ b/include/backend/drm/properties.h
+@@ -44,6 +44,7 @@ union wlr_drm_plane_props {
+ 	struct {
+ 		uint32_t type;
+ 		uint32_t rotation; // Not guaranteed to exist
++		uint32_t in_formats; // Not guaranteed to exist
+ 
+ 		// atomic-modesetting only
+ 
+@@ -58,7 +59,7 @@ union wlr_drm_plane_props {
+ 		uint32_t fb_id;
+ 		uint32_t crtc_id;
+ 	};
+-	uint32_t props[12];
++	uint32_t props[13];
+ };
+ 
+ bool get_drm_connector_props(int fd, uint32_t id,
+diff --git a/include/wlr/render/drm_format_set.h b/include/wlr/render/drm_format_set.h
+index 588914ae0..15d4eea3f 100644
+--- a/include/wlr/render/drm_format_set.h
++++ b/include/wlr/render/drm_format_set.h
+@@ -21,6 +21,9 @@ void wlr_drm_format_set_finish(struct wlr_drm_format_set *set);
+ const struct wlr_drm_format *wlr_drm_format_set_get(
+ 	const struct wlr_drm_format_set *set, uint32_t format);
+ 
++bool wlr_drm_format_set_has(const struct wlr_drm_format_set *set,
++	uint32_t format, uint64_t modifier);
++
+ bool wlr_drm_format_set_add(struct wlr_drm_format_set *set, uint32_t format,
+ 	uint64_t modifier);
+ 
+diff --git a/render/drm_format_set.c b/render/drm_format_set.c
+index df683b6da..b09a68a42 100644
+--- a/render/drm_format_set.c
++++ b/render/drm_format_set.c
+@@ -35,6 +35,26 @@ const struct wlr_drm_format *wlr_drm_format_set_get(
+ 	return ptr ? *ptr : NULL;
+ }
+ 
++bool wlr_drm_format_set_has(const struct wlr_drm_format_set *set,
++		uint32_t format, uint64_t modifier) {
++	const struct wlr_drm_format *fmt = wlr_drm_format_set_get(set, format);
++	if (!fmt) {
++		return false;
++	}
++
++	if (modifier == DRM_FORMAT_MOD_INVALID) {
++		return true;
++	}
++
++	for (size_t i = 0; i < fmt->len; ++i) {
++		if (fmt->modifiers[i] == modifier) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ bool wlr_drm_format_set_add(struct wlr_drm_format_set *set, uint32_t format,
+ 		uint64_t modifier) {
+ 	struct wlr_drm_format **ptr = format_set_get_ref(set, format);
+
+From 1d330a0a49a4b70db594af392ad8e1cf7f467fa2 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Mon, 22 Apr 2019 09:08:10 +0300
+Subject: [PATCH 03/16] backend/drm: strip alpha channel on scan-out
+
+---
+ backend/drm/drm.c | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index a2a117d6f..fabdf77b4 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -859,6 +859,15 @@ static bool drm_connector_schedule_frame(struct wlr_output *output) {
+ 	return true;
+ }
+ 
++static uint32_t strip_alpha_channel(uint32_t format) {
++	switch (format) {
++	case DRM_FORMAT_ARGB8888:
++		return DRM_FORMAT_XRGB8888;
++	default:
++		return DRM_FORMAT_INVALID;
++	}
++}
++
+ static bool drm_connector_set_dmabuf(struct wlr_output *output,
+ 		struct wlr_dmabuf_attributes *attribs) {
+ 	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+@@ -875,9 +884,21 @@ static bool drm_connector_set_dmabuf(struct wlr_output *output,
+ 	if (attribs->width != output->width || attribs->height != output->height) {
+ 		return false;
+ 	}
++
++	struct wlr_dmabuf_attributes attribs_stripped_alpha;
+ 	if (!wlr_drm_format_set_has(&crtc->primary->formats,
+ 			attribs->format, attribs->modifier)) {
+-		return false;
++		// The format isn't supported by the plane. Try stripping the alpha
++		// channel, if any.
++		uint32_t format = strip_alpha_channel(attribs->format);
++		if (format != DRM_FORMAT_INVALID && wlr_drm_format_set_has(
++				&crtc->primary->formats, format, attribs->modifier)) {
++			attribs_stripped_alpha = *attribs;
++			attribs_stripped_alpha.format = format;
++			attribs = &attribs_stripped_alpha;
++		} else {
++			return false;
++		}
+ 	}
+ 
+ 	struct gbm_bo *bo = import_gbm_bo(&drm->renderer, attribs);
+
+From 25737a3ac2e483a8d20c99ab00050c4705ff2b41 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Mon, 29 Apr 2019 22:32:35 +0300
+Subject: [PATCH 04/16] render/dmabuf: add wlr_dmabuf_attributes_copy
+
+---
+ include/wlr/render/dmabuf.h |  6 ++++++
+ render/dmabuf.c             | 20 +++++++++++++++++++-
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/include/wlr/render/dmabuf.h b/include/wlr/render/dmabuf.h
+index 1d61da4e1..93e50eb30 100644
+--- a/include/wlr/render/dmabuf.h
++++ b/include/wlr/render/dmabuf.h
+@@ -9,6 +9,7 @@
+ #ifndef WLR_RENDER_DMABUF_H
+ #define WLR_RENDER_DMABUF_H
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ #define WLR_DMABUF_MAX_PLANES 4
+@@ -35,5 +36,10 @@ struct wlr_dmabuf_attributes {
+  * Closes all file descriptors in the DMA-BUF attributes.
+  */
+ void wlr_dmabuf_attributes_finish(struct wlr_dmabuf_attributes *attribs);
++/**
++ * Clones the DMA-BUF attributes.
++ */
++bool wlr_dmabuf_attributes_copy(struct wlr_dmabuf_attributes *dst,
++	struct wlr_dmabuf_attributes *src);
+ 
+ #endif
+diff --git a/render/dmabuf.c b/render/dmabuf.c
+index 6b5007486..bed609dd0 100644
+--- a/render/dmabuf.c
++++ b/render/dmabuf.c
+@@ -1,10 +1,28 @@
++#define _POSIX_C_SOURCE 200809L
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <wlr/render/dmabuf.h>
++#include <wlr/util/log.h>
+ 
+-void wlr_dmabuf_attributes_finish( struct wlr_dmabuf_attributes *attribs) {
++void wlr_dmabuf_attributes_finish(struct wlr_dmabuf_attributes *attribs) {
+ 	for (int i = 0; i < attribs->n_planes; ++i) {
+ 		close(attribs->fd[i]);
+ 		attribs->fd[i] = -1;
+ 	}
+ 	attribs->n_planes = 0;
+ }
++
++bool wlr_dmabuf_attributes_copy(struct wlr_dmabuf_attributes *dst,
++		struct wlr_dmabuf_attributes *src) {
++	memcpy(dst, src, sizeof(struct wlr_dmabuf_attributes));
++
++	for (int i = 0; i < src->n_planes; ++i) {
++		dst->fd[i] = fcntl(src->fd[i], F_DUPFD_CLOEXEC, 0);
++		if (dst->fd[i] < 0) {
++			wlr_log_errno(WLR_ERROR, "fcntl(F_DUPFD_CLOEXEC) failed");
++			return false;
++		}
++	}
++
++	return true;
++}
+
+From 1893830a743a6a353b1620a092e526d03f073151 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Mon, 29 Apr 2019 22:33:46 +0300
+Subject: [PATCH 05/16] buffer: add wlr_buffer_get_dmabuf
+
+---
+ include/wlr/types/wlr_buffer.h |  7 +++++++
+ types/wlr_buffer.c             | 18 ++++++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/include/wlr/types/wlr_buffer.h b/include/wlr/types/wlr_buffer.h
+index 0c987b170..11b365968 100644
+--- a/include/wlr/types/wlr_buffer.h
++++ b/include/wlr/types/wlr_buffer.h
+@@ -11,6 +11,7 @@
+ 
+ #include <pixman.h>
+ #include <wayland-server.h>
++#include <wlr/render/dmabuf.h>
+ 
+ /**
+  * A client buffer.
+@@ -67,5 +68,11 @@ void wlr_buffer_unref(struct wlr_buffer *buffer);
+  */
+ struct wlr_buffer *wlr_buffer_apply_damage(struct wlr_buffer *buffer,
+ 	struct wl_resource *resource, pixman_region32_t *damage);
++/**
++ * Reads the DMA-BUF attributes of the buffer. If this buffer isn't a DMA-BUF,
++ * returns false.
++ */
++bool wlr_buffer_get_dmabuf(struct wlr_buffer *buffer,
++		struct wlr_dmabuf_attributes *attribs);
+ 
+ #endif
+diff --git a/types/wlr_buffer.c b/types/wlr_buffer.c
+index cec3475cf..9d079b9a6 100644
+--- a/types/wlr_buffer.c
++++ b/types/wlr_buffer.c
+@@ -203,3 +203,21 @@ struct wlr_buffer *wlr_buffer_apply_damage(struct wlr_buffer *buffer,
+ 	buffer->released = true;
+ 	return buffer;
+ }
++
++bool wlr_buffer_get_dmabuf(struct wlr_buffer *buffer,
++		struct wlr_dmabuf_attributes *attribs) {
++	if (buffer->resource == NULL) {
++		return false;
++	}
++
++	struct wl_resource *buffer_resource = buffer->resource;
++	if (!wlr_dmabuf_v1_resource_is_buffer(buffer_resource)) {
++		return false;
++	}
++
++	struct wlr_dmabuf_v1_buffer *dmabuf_buffer =
++		wlr_dmabuf_v1_buffer_from_buffer_resource(buffer_resource);
++	memcpy(attribs, &dmabuf_buffer->attributes,
++		sizeof(struct wlr_dmabuf_attributes));
++	return true;
++}
+
+From 3d03e7a7e786e6933c6bdce6ac8d4fe63c2bae50 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Mon, 29 Apr 2019 22:04:18 +0300
+Subject: [PATCH 06/16] output: change set_dmabuf to attach_buffer
+
+---
+ backend/drm/drm.c                   | 26 ++++++++++++++------------
+ include/wlr/interfaces/wlr_output.h |  3 +--
+ include/wlr/types/wlr_output.h      |  9 +++++++--
+ types/wlr_output.c                  | 10 +++++-----
+ 4 files changed, 27 insertions(+), 21 deletions(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index fabdf77b4..0f548f456 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -868,8 +868,8 @@ static uint32_t strip_alpha_channel(uint32_t format) {
+ 	}
+ }
+ 
+-static bool drm_connector_set_dmabuf(struct wlr_output *output,
+-		struct wlr_dmabuf_attributes *attribs) {
++static bool drm_connector_attach_buffer(struct wlr_output *output,
++		struct wlr_buffer *buffer) {
+ 	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+ 	struct wlr_drm_backend *drm = get_drm_backend_from_backend(output->backend);
+ 	if (!drm->session->active) {
+@@ -881,27 +881,29 @@ static bool drm_connector_set_dmabuf(struct wlr_output *output,
+ 		return false;
+ 	}
+ 
+-	if (attribs->width != output->width || attribs->height != output->height) {
++	struct wlr_dmabuf_attributes attribs;
++	if (!wlr_buffer_get_dmabuf(buffer, &attribs)) {
++		return false;
++	}
++
++	if (attribs.width != output->width || attribs.height != output->height) {
+ 		return false;
+ 	}
+ 
+-	struct wlr_dmabuf_attributes attribs_stripped_alpha;
+ 	if (!wlr_drm_format_set_has(&crtc->primary->formats,
+-			attribs->format, attribs->modifier)) {
++			attribs.format, attribs.modifier)) {
+ 		// The format isn't supported by the plane. Try stripping the alpha
+ 		// channel, if any.
+-		uint32_t format = strip_alpha_channel(attribs->format);
++		uint32_t format = strip_alpha_channel(attribs.format);
+ 		if (format != DRM_FORMAT_INVALID && wlr_drm_format_set_has(
+-				&crtc->primary->formats, format, attribs->modifier)) {
+-			attribs_stripped_alpha = *attribs;
+-			attribs_stripped_alpha.format = format;
+-			attribs = &attribs_stripped_alpha;
++				&crtc->primary->formats, format, attribs.modifier)) {
++			attribs.format = format;
+ 		} else {
+ 			return false;
+ 		}
+ 	}
+ 
+-	struct gbm_bo *bo = import_gbm_bo(&drm->renderer, attribs);
++	struct gbm_bo *bo = import_gbm_bo(&drm->renderer, &attribs);
+ 	if (bo == NULL) {
+ 		wlr_log(WLR_ERROR, "import_gbm_bo failed");
+ 		return NULL;
+@@ -950,7 +952,7 @@ static const struct wlr_output_impl output_impl = {
+ 	.get_gamma_size = drm_connector_get_gamma_size,
+ 	.export_dmabuf = drm_connector_export_dmabuf,
+ 	.schedule_frame = drm_connector_schedule_frame,
+-	.set_dmabuf = drm_connector_set_dmabuf,
++	.attach_buffer = drm_connector_attach_buffer,
+ };
+ 
+ bool wlr_output_is_drm(struct wlr_output *output) {
+diff --git a/include/wlr/interfaces/wlr_output.h b/include/wlr/interfaces/wlr_output.h
+index a70c86e66..dc7a76d2e 100644
+--- a/include/wlr/interfaces/wlr_output.h
++++ b/include/wlr/interfaces/wlr_output.h
+@@ -34,8 +34,7 @@ struct wlr_output_impl {
+ 	bool (*export_dmabuf)(struct wlr_output *output,
+ 		struct wlr_dmabuf_attributes *attribs);
+ 	bool (*schedule_frame)(struct wlr_output *output);
+-	bool (*set_dmabuf)(struct wlr_output *output,
+-		struct wlr_dmabuf_attributes *attribs);
++	bool (*attach_buffer)(struct wlr_output *output, struct wlr_buffer *buffer);
+ };
+ 
+ void wlr_output_init(struct wlr_output *output, struct wlr_backend *backend,
+diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
+index 163d54ad9..ffe13fb83 100644
+--- a/include/wlr/types/wlr_output.h
++++ b/include/wlr/types/wlr_output.h
+@@ -15,6 +15,7 @@
+ #include <wayland-server.h>
+ #include <wayland-util.h>
+ #include <wlr/render/dmabuf.h>
++#include <wlr/types/wlr_buffer.h>
+ 
+ struct wlr_output_mode {
+ 	uint32_t flags; // enum wl_output_mode
+@@ -223,6 +224,12 @@ void wlr_output_effective_resolution(struct wlr_output *output,
+  * frames or -1 if unknown. This is useful for damage tracking.
+  */
+ bool wlr_output_attach_render(struct wlr_output *output, int *buffer_age);
++/**
++ * Attach a buffer to the output. Compositors should call `wlr_output_commit`
++ * to submit the new frame.
++ */
++bool wlr_output_attach_buffer(struct wlr_output *output,
++	struct wlr_buffer *buffer);
+ /**
+  * Get the preferred format for reading pixels.
+  * This function might change the current rendering context.
+@@ -243,8 +250,6 @@ bool wlr_output_preferred_read_format(struct wlr_output *output,
+  */
+ void wlr_output_set_damage(struct wlr_output *output,
+ 	pixman_region32_t *damage);
+-bool wlr_output_set_dmabuf(struct wlr_output *output,
+-	struct wlr_dmabuf_attributes *attribs);
+ /**
+  * Commit the pending output state. If `wlr_output_attach_render` has been
+  * called, the pending frame will be submitted for display.
+diff --git a/types/wlr_output.c b/types/wlr_output.c
+index a673f1a85..e80e5643e 100644
+--- a/types/wlr_output.c
++++ b/types/wlr_output.c
+@@ -474,8 +474,8 @@ bool wlr_output_commit(struct wlr_output *output) {
+ 	return true;
+ }
+ 
+-bool wlr_output_set_dmabuf(struct wlr_output *output,
+-		struct wlr_dmabuf_attributes *attribs) {
++bool wlr_output_attach_buffer(struct wlr_output *output,
++		struct wlr_buffer *buffer) {
+ 	if (output->frame_pending) {
+ 		wlr_log(WLR_ERROR, "Tried to swap buffers when a frame is pending");
+ 		return false;
+@@ -485,15 +485,15 @@ bool wlr_output_set_dmabuf(struct wlr_output *output,
+ 		output->idle_frame = NULL;
+ 	}
+ 
+-	if (!output->impl->set_dmabuf) {
++	if (!output->impl->attach_buffer) {
+ 		return false;
+ 	}
+-	if (!output->impl->set_dmabuf(output, attribs)) {
++	if (!output->impl->attach_buffer(output, buffer)) {
+ 		return false;
+ 	}
+ 
+ 	output->frame_pending = true;
+-	output->needs_swap = false;
++	output->needs_frame = false;
+ 	pixman_region32_clear(&output->damage);
+ 	return true;
+ }
+
+From c01c74aaad030e710f44dc8281b235a9f0b95156 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Mon, 29 Apr 2019 23:25:47 +0300
+Subject: [PATCH 07/16] output: fix attach_buffer semantics
+
+---
+ backend/drm/drm.c              | 66 +++++++++++++++++++---------------
+ include/backend/drm/drm.h      |  2 ++
+ include/wlr/types/wlr_output.h |  9 +++++
+ types/wlr_output.c             | 15 ++------
+ 4 files changed, 52 insertions(+), 40 deletions(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 0f548f456..37116af82 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -301,11 +301,44 @@ static bool drm_connector_commit(struct wlr_output *output) {
+ 		damage = &output->pending.damage;
+ 	}
+ 
+-	struct gbm_bo *bo = swap_drm_surface_buffers(&plane->surf, damage);
+-	if (drm->parent) {
+-		bo = copy_drm_surface_mgpu(&plane->mgpu_surf, bo);
++	struct gbm_bo *bo;
++	uint32_t fb_id = 0;
++	assert(output->pending.committed & WLR_OUTPUT_STATE_BUFFER);
++	switch (output->pending.buffer_type) {
++	case WLR_OUTPUT_STATE_BUFFER_RENDER:
++		bo = swap_drm_surface_buffers(&plane->surf, damage);
++		if (bo == NULL) {
++			wlr_log(WLR_ERROR, "swap_drm_surface_buffers failed");
++			return false;
++		}
++
++		if (drm->parent) {
++			bo = copy_drm_surface_mgpu(&plane->mgpu_surf, bo);
++			if (bo == NULL) {
++				wlr_log(WLR_ERROR, "copy_drm_surface_mgpu failed");
++				return false;
++			}
++		}
++		fb_id = get_fb_for_bo(bo, plane->drm_format);
++		if (fb_id == 0) {
++			wlr_log(WLR_ERROR, "get_fb_for_bo failed");
++			return false;
++		}
++		break;
++	case WLR_OUTPUT_STATE_BUFFER_SCANOUT:
++		bo = import_gbm_bo(&drm->renderer, &conn->pending_dmabuf);
++		if (bo == NULL) {
++			wlr_log(WLR_ERROR, "import_gbm_bo failed");
++			return false;
++		}
++
++		fb_id = get_fb_for_bo(bo, gbm_bo_get_format(bo));
++		if (fb_id == 0) {
++			wlr_log(WLR_ERROR, "get_fb_for_bo failed");
++			return false;
++		}
++		break;
+ 	}
+-	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
+ 
+ 	if (conn->pageflip_pending) {
+ 		wlr_log(WLR_ERROR, "Skipping pageflip on output '%s'", conn->output.name);
+@@ -903,30 +936,7 @@ static bool drm_connector_attach_buffer(struct wlr_output *output,
+ 		}
+ 	}
+ 
+-	struct gbm_bo *bo = import_gbm_bo(&drm->renderer, &attribs);
+-	if (bo == NULL) {
+-		wlr_log(WLR_ERROR, "import_gbm_bo failed");
+-		return NULL;
+-	}
+-
+-	uint32_t fb_id = get_fb_for_bo(bo, gbm_bo_get_format(bo));
+-	if (fb_id == 0) {
+-		wlr_log(WLR_ERROR, "get_fb_for_bo failed");
+-		return false;
+-	}
+-
+-	if (conn->pageflip_pending) {
+-		wlr_log(WLR_ERROR, "Skipping pageflip on output '%s'", conn->output.name);
+-		return false;
+-	}
+-
+-	if (!drm->iface->crtc_pageflip(drm, conn, crtc, fb_id, NULL)) {
+-		wlr_log(WLR_ERROR, "crtc_pageflip failed");
+-		return false;
+-	}
+-
+-	conn->pageflip_pending = true;
+-	wlr_output_update_enabled(output, true);
++	memcpy(&conn->pending_dmabuf, &attribs, sizeof(attribs));
+ 	return true;
+ }
+ 
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index ba08449af..a20002b02 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -148,6 +148,8 @@ struct wlr_drm_connector {
+ 	bool pageflip_pending;
+ 	struct wl_event_source *retry_pageflip;
+ 	struct wl_list link;
++
++	struct wlr_dmabuf_attributes pending_dmabuf;
+ };
+ 
+ struct wlr_drm_backend *get_drm_backend_from_backend(
+diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
+index ffe13fb83..cd05cfb49 100644
+--- a/include/wlr/types/wlr_output.h
++++ b/include/wlr/types/wlr_output.h
+@@ -52,12 +52,21 @@ enum wlr_output_state_field {
+ 	WLR_OUTPUT_STATE_DAMAGE = 1 << 1,
+ };
+ 
++enum wlr_output_state_buffer_type {
++	WLR_OUTPUT_STATE_BUFFER_RENDER,
++	WLR_OUTPUT_STATE_BUFFER_SCANOUT,
++};
++
+ /**
+  * Holds the double-buffered output state.
+  */
+ struct wlr_output_state {
+ 	uint32_t committed; // enum wlr_output_state_field
+ 	pixman_region32_t damage; // output-buffer-local coordinates
++
++	// only valid if WLR_OUTPUT_STATE_BUFFER
++	enum wlr_output_state_buffer_type buffer_type;
++	struct wlr_buffer *buffer; // if WLR_OUTPUT_STATE_BUFFER_SCANOUT
+ };
+ 
+ struct wlr_output_impl;
+diff --git a/types/wlr_output.c b/types/wlr_output.c
+index e80e5643e..a7fb6a0c6 100644
+--- a/types/wlr_output.c
++++ b/types/wlr_output.c
+@@ -400,6 +400,7 @@ bool wlr_output_attach_render(struct wlr_output *output, int *buffer_age) {
+ 	}
+ 
+ 	output->pending.committed |= WLR_OUTPUT_STATE_BUFFER;
++	output->pending.buffer_type = WLR_OUTPUT_STATE_BUFFER_RENDER;
+ 	return true;
+ }
+ 
+@@ -476,15 +477,6 @@ bool wlr_output_commit(struct wlr_output *output) {
+ 
+ bool wlr_output_attach_buffer(struct wlr_output *output,
+ 		struct wlr_buffer *buffer) {
+-	if (output->frame_pending) {
+-		wlr_log(WLR_ERROR, "Tried to swap buffers when a frame is pending");
+-		return false;
+-	}
+-	if (output->idle_frame != NULL) {
+-		wl_event_source_remove(output->idle_frame);
+-		output->idle_frame = NULL;
+-	}
+-
+ 	if (!output->impl->attach_buffer) {
+ 		return false;
+ 	}
+@@ -492,9 +484,8 @@ bool wlr_output_attach_buffer(struct wlr_output *output,
+ 		return false;
+ 	}
+ 
+-	output->frame_pending = true;
+-	output->needs_frame = false;
+-	pixman_region32_clear(&output->damage);
++	output->pending.committed |= WLR_OUTPUT_STATE_BUFFER;
++	output->pending.buffer_type = WLR_OUTPUT_STATE_BUFFER_SCANOUT;
+ 	return true;
+ }
+ 
+
+From db90fd8a6064647c6374bd020e015909c7d9acd0 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sat, 4 May 2019 11:53:40 +0300
+Subject: [PATCH 08/16] output: save buffer in pending state
+
+---
+ types/wlr_output.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/types/wlr_output.c b/types/wlr_output.c
+index a7fb6a0c6..ec1e8fa14 100644
+--- a/types/wlr_output.c
++++ b/types/wlr_output.c
+@@ -394,11 +394,23 @@ struct wlr_output_mode *wlr_output_preferred_mode(struct wlr_output *output) {
+ 	return mode;
+ }
+ 
++static void output_state_clear_buffer(struct wlr_output_state *state) {
++	if (!(state->committed & WLR_OUTPUT_STATE_BUFFER)) {
++		return;
++	}
++
++	wlr_buffer_unref(state->buffer);
++	state->buffer = NULL;
++
++	state->committed &= ~WLR_OUTPUT_STATE_BUFFER;
++}
++
+ bool wlr_output_attach_render(struct wlr_output *output, int *buffer_age) {
+ 	if (!output->impl->attach_render(output, buffer_age)) {
+ 		return false;
+ 	}
+ 
++	output_state_clear_buffer(&output->pending);
+ 	output->pending.committed |= WLR_OUTPUT_STATE_BUFFER;
+ 	output->pending.buffer_type = WLR_OUTPUT_STATE_BUFFER_RENDER;
+ 	return true;
+@@ -426,8 +438,9 @@ void wlr_output_set_damage(struct wlr_output *output,
+ }
+ 
+ static void output_state_clear(struct wlr_output_state *state) {
+-	state->committed = 0;
++	output_state_clear_buffer(state);
+ 	pixman_region32_clear(&state->damage);
++	state->committed = 0;
+ }
+ 
+ bool wlr_output_commit(struct wlr_output *output) {
+@@ -484,8 +497,10 @@ bool wlr_output_attach_buffer(struct wlr_output *output,
+ 		return false;
+ 	}
+ 
++	output_state_clear_buffer(&output->pending);
+ 	output->pending.committed |= WLR_OUTPUT_STATE_BUFFER;
+ 	output->pending.buffer_type = WLR_OUTPUT_STATE_BUFFER_SCANOUT;
++	output->pending.buffer = wlr_buffer_ref(buffer);
+ 	return true;
+ }
+ 
+
+From 5dff9dee07197d015e255be981ccb910ce46b291 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sat, 4 May 2019 12:07:37 +0300
+Subject: [PATCH 09/16] backend/drm: hold buffers while scanning out
+
+---
+ backend/drm/drm.c         | 30 +++++++++++++++++++++++++-----
+ include/backend/drm/drm.h |  5 +++++
+ 2 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 37116af82..70a1eddea 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -350,6 +350,11 @@ static bool drm_connector_commit(struct wlr_output *output) {
+ 	}
+ 
+ 	conn->pageflip_pending = true;
++	if (output->pending.buffer_type == WLR_OUTPUT_STATE_BUFFER_SCANOUT) {
++		wlr_buffer_unref(conn->pending_buffer);
++		conn->pending_buffer = wlr_buffer_ref(output->pending.buffer);
++	}
++
+ 	wlr_output_update_enabled(output, true);
+ 	return true;
+ }
+@@ -1440,9 +1445,21 @@ static void page_flip_handler(int fd, unsigned seq,
+ 		return;
+ 	}
+ 
+-	post_drm_surface(&conn->crtc->primary->surf);
+-	if (drm->parent) {
+-		post_drm_surface(&conn->crtc->primary->mgpu_surf);
++	// Release the old buffer as it's not displayed anymore. The pending
++	// buffer becomes the current buffer.
++	wlr_buffer_unref(conn->current_buffer);
++	conn->current_buffer = conn->pending_buffer;
++	conn->pending_buffer = NULL;
++
++	uint32_t present_flags = WLR_OUTPUT_PRESENT_VSYNC |
++		WLR_OUTPUT_PRESENT_HW_CLOCK | WLR_OUTPUT_PRESENT_HW_COMPLETION;
++	if (conn->current_buffer != NULL) {
++		present_flags |= WLR_OUTPUT_PRESENT_ZERO_COPY;
++	} else {
++		post_drm_surface(&conn->crtc->primary->surf);
++		if (drm->parent) {
++			post_drm_surface(&conn->crtc->primary->mgpu_surf);
++		}
+ 	}
+ 
+ 	struct timespec present_time = {
+@@ -1453,8 +1470,7 @@ static void page_flip_handler(int fd, unsigned seq,
+ 		.when = &present_time,
+ 		.seq = seq,
+ 		.refresh = mhz_to_nsec(conn->output.refresh),
+-		.flags = WLR_OUTPUT_PRESENT_VSYNC | WLR_OUTPUT_PRESENT_HW_CLOCK |
+-			WLR_OUTPUT_PRESENT_HW_COMPLETION,
++		.flags = present_flags,
+ 	};
+ 	wlr_output_send_present(&conn->output, &present_event);
+ 
+@@ -1559,6 +1575,10 @@ static void drm_connector_cleanup(struct wlr_drm_connector *conn) {
+ 		conn->output.needs_frame = false;
+ 		conn->output.frame_pending = false;
+ 
++		wlr_buffer_unref(conn->pending_buffer);
++		wlr_buffer_unref(conn->current_buffer);
++		conn->pending_buffer = conn->current_buffer = NULL;
++
+ 		/* Fallthrough */
+ 	case WLR_DRM_CONN_NEEDS_MODESET:
+ 		wlr_log(WLR_INFO, "Emitting destruction signal for '%s'",
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index a20002b02..3821c3589 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -149,7 +149,12 @@ struct wlr_drm_connector {
+ 	struct wl_event_source *retry_pageflip;
+ 	struct wl_list link;
+ 
++	// DMA-BUF to be displayed on next commit
+ 	struct wlr_dmabuf_attributes pending_dmabuf;
++	// Buffer submitted to the kernel but not yet displayed
++	struct wlr_buffer *pending_buffer;
++	// Buffer currently being displayed
++	struct wlr_buffer *current_buffer;
+ };
+ 
+ struct wlr_drm_backend *get_drm_backend_from_backend(
+
+From 877d373bb548084c4f9883726d991108fd5e06cc Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sat, 4 May 2019 12:10:29 +0300
+Subject: [PATCH 10/16] backend/drm: reject DMA-BUFs with flags
+
+---
+ backend/drm/drm.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 70a1eddea..9d1778109 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -924,6 +924,9 @@ static bool drm_connector_attach_buffer(struct wlr_output *output,
+ 		return false;
+ 	}
+ 
++	if (attribs.flags != 0) {
++		return false;
++	}
+ 	if (attribs.width != output->width || attribs.height != output->height) {
+ 		return false;
+ 	}
+
+From 736074c582d29cf34d009fa18735d7e7830e6f83 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Mon, 29 Apr 2019 23:28:39 +0300
+Subject: [PATCH 11/16] rootston: add support for direct scan-out
+
+---
+ rootston/render.c | 104 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 97 insertions(+), 7 deletions(-)
+
+diff --git a/rootston/render.c b/rootston/render.c
+index 712e47c02..3b242b88b 100644
+--- a/rootston/render.c
++++ b/rootston/render.c
+@@ -6,6 +6,8 @@
+ #include <wlr/config.h>
+ #include <wlr/types/wlr_compositor.h>
+ #include <wlr/types/wlr_matrix.h>
++#include <wlr/types/wlr_buffer.h>
++#include <wlr/types/wlr_linux_dmabuf_v1.h>
+ #include <wlr/util/log.h>
+ #include <wlr/util/region.h>
+ #include "rootston/layers.h"
+@@ -175,6 +177,76 @@ static void render_drag_icons(struct roots_output *output,
+ 		render_surface_iterator, &data);
+ }
+ 
++static void count_surface_iterator(struct roots_output *output,
++		struct wlr_surface *surface, struct wlr_box *_box, float rotation,
++		void *data) {
++	size_t *n = data;
++	n++;
++}
++
++static bool scan_out_fullscreen_view(struct roots_output *output) {
++	struct wlr_output *wlr_output = output->wlr_output;
++	struct roots_desktop *desktop = output->desktop;
++
++	struct roots_seat *seat;
++	wl_list_for_each(seat, &desktop->server->input->seats, link) {
++		struct roots_drag_icon *drag_icon = seat->drag_icon;
++		if (drag_icon && drag_icon->wlr_drag_icon->mapped) {
++			return false;
++		}
++	}
++
++	if (!wl_list_empty(&output->layers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY])) {
++		return false;
++	}
++
++	struct wlr_output_cursor *cursor;
++	wl_list_for_each(cursor, &wlr_output->cursors, link) {
++		if (cursor->enabled && cursor->visible &&
++				wlr_output->hardware_cursor != cursor) {
++			return false;
++		}
++	}
++
++	struct roots_view *view = output->fullscreen_view;
++	assert(view != NULL);
++	if (view->wlr_surface == NULL) {
++		return false;
++	}
++	size_t n_surfaces = 0;
++	output_view_for_each_surface(output, view,
++		count_surface_iterator, &n_surfaces);
++	if (n_surfaces > 1) {
++		return false;
++	}
++
++#if WLR_HAS_XWAYLAND
++	if (view->type == ROOTS_XWAYLAND_VIEW) {
++		struct roots_xwayland_surface *xwayland_surface =
++			roots_xwayland_surface_from_view(view);
++		if (!wl_list_empty(&xwayland_surface->xwayland_surface->children)) {
++			return false;
++		}
++	}
++#endif
++
++	struct wlr_surface *surface = view->wlr_surface;
++
++	if (surface->buffer == NULL) {
++		return false;
++	}
++
++	if ((float)surface->current.scale != wlr_output->scale ||
++			surface->current.transform != wlr_output->transform) {
++		return false;
++	}
++
++	if (!wlr_output_attach_buffer(wlr_output, surface->buffer)) {
++		return false;
++	}
++	return wlr_output_commit(wlr_output);
++}
++
+ static void surface_send_frame_done_iterator(struct roots_output *output,
+ 		struct wlr_surface *surface, struct wlr_box *box, float rotation,
+ 		void *data) {
+@@ -218,6 +290,22 @@ void output_render(struct roots_output *output) {
+ 
+ 		// Fullscreen views are rendered on a black background
+ 		clear_color[0] = clear_color[1] = clear_color[2] = 0;
++
++		// Check if we can scan-out the fullscreen view
++		static bool last_scanned_out = false;
++		bool scanned_out = scan_out_fullscreen_view(output);
++
++		if (scanned_out && !last_scanned_out) {
++			wlr_log(WLR_DEBUG, "Scanning out fullscreen view");
++		}
++		if (last_scanned_out && !scanned_out) {
++			wlr_log(WLR_DEBUG, "Stopping fullscreen view scan out");
++		}
++		last_scanned_out = scanned_out;
++
++		if (scanned_out) {
++			goto send_frame_done;
++		}
+ 	}
+ 
+ 	bool needs_frame;
+@@ -256,15 +344,9 @@ void output_render(struct roots_output *output) {
+ 		wlr_renderer_clear(renderer, clear_color);
+ 	}
+ 
+-	render_layer(output, &buffer_damage,
+-		&output->layers[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND]);
+-	render_layer(output, &buffer_damage,
+-		&output->layers[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM]);
+-
+ 	// If a view is fullscreen on this output, render it
+ 	if (output->fullscreen_view != NULL) {
+ 		struct roots_view *view = output->fullscreen_view;
+-
+ 		render_view(output, view, &data);
+ 
+ 		// During normal rendering the xwayland window tree isn't traversed
+@@ -280,12 +362,19 @@ void output_render(struct roots_output *output) {
+ 		}
+ #endif
+ 	} else {
++		// Render background and bottom layers under views
++		render_layer(output, &buffer_damage,
++			&output->layers[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND]);
++		render_layer(output, &buffer_damage,
++			&output->layers[ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM]);
++
+ 		// Render all views
+ 		struct roots_view *view;
+ 		wl_list_for_each_reverse(view, &desktop->views, link) {
+ 			render_view(output, view, &data);
+ 		}
+-		// Render top layer above shell views
++
++		// Render top layer above views
+ 		render_layer(output, &buffer_damage,
+ 			&output->layers[ZWLR_LAYER_SHELL_V1_LAYER_TOP]);
+ 	}
+@@ -327,6 +416,7 @@ void output_render(struct roots_output *output) {
+ buffer_damage_finish:
+ 	pixman_region32_fini(&buffer_damage);
+ 
++send_frame_done:
+ 	// Send frame done events to all surfaces
+ 	output_for_each_surface(output, surface_send_frame_done_iterator, &now);
+ }
+
+From 082bdd0b0c9d81adee191cf9142ac70ecb03d4f2 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sat, 4 May 2019 12:33:47 +0300
+Subject: [PATCH 12/16] output: refuse to scan-out if software cursors are used
+
+---
+ types/wlr_output.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/types/wlr_output.c b/types/wlr_output.c
+index ec1e8fa14..dc39d12b1 100644
+--- a/types/wlr_output.c
++++ b/types/wlr_output.c
+@@ -493,6 +493,17 @@ bool wlr_output_attach_buffer(struct wlr_output *output,
+ 	if (!output->impl->attach_buffer) {
+ 		return false;
+ 	}
++
++	// If the output has at least one software cursor, refuse to attach the
++	// buffer
++	struct wlr_output_cursor *cursor;
++	wl_list_for_each(cursor, &output->cursors, link) {
++		if (cursor->enabled && cursor->visible &&
++				cursor != output->hardware_cursor) {
++			return false;
++		}
++	}
++
+ 	if (!output->impl->attach_buffer(output, buffer)) {
+ 		return false;
+ 	}
+
+From 19ab173c65280612183fd93992d6ce6ed965f6ed Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sat, 25 May 2019 18:51:28 +0300
+Subject: [PATCH 13/16] output: introduce wlr_output_lock_attach_render
+
+This allows screen shooters and screen grabbers to ensure rendering will be
+used instead of direct scan-out.
+---
+ include/wlr/types/wlr_output.h |  9 +++++++++
+ types/wlr_export_dmabuf_v1.c   |  2 ++
+ types/wlr_output.c             | 15 +++++++++++++++
+ types/wlr_screencopy_v1.c      |  2 ++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
+index cd05cfb49..dff9f4ebe 100644
+--- a/include/wlr/types/wlr_output.h
++++ b/include/wlr/types/wlr_output.h
+@@ -137,6 +137,8 @@ struct wlr_output {
+ 	struct wl_event_source *idle_frame;
+ 	struct wl_event_source *idle_done;
+ 
++	int attach_render_locks; // number of locks forcing rendering
++
+ 	struct wl_list cursors; // wlr_output_cursor::link
+ 	struct wlr_output_cursor *hardware_cursor;
+ 	int software_cursor_locks; // number of locks forcing software cursors
+@@ -287,6 +289,13 @@ bool wlr_output_set_gamma(struct wlr_output *output, size_t size,
+ bool wlr_output_export_dmabuf(struct wlr_output *output,
+ 	struct wlr_dmabuf_attributes *attribs);
+ struct wlr_output *wlr_output_from_resource(struct wl_resource *resource);
++/**
++ * Locks the output to only use rendering instead of direct scan-out. This is
++ * useful if direct scan-out needs to be temporarily disabled (e.g. during
++ * screen capture). There must be as many unlocks as there have been locks to
++ * restore the original state. There should never be an unlock before a lock.
++ */
++void wlr_output_lock_attach_render(struct wlr_output *output, bool lock);
+ /**
+  * Locks the output to only use software cursors instead of hardware cursors.
+  * This is useful if hardware cursors need to be temporarily disabled (e.g.
+diff --git a/types/wlr_export_dmabuf_v1.c b/types/wlr_export_dmabuf_v1.c
+index fa3ae5dcd..4519350e7 100644
+--- a/types/wlr_export_dmabuf_v1.c
++++ b/types/wlr_export_dmabuf_v1.c
+@@ -34,6 +34,7 @@ static void frame_destroy(struct wlr_export_dmabuf_frame_v1 *frame) {
+ 	if (frame == NULL) {
+ 		return;
+ 	}
++	wlr_output_lock_attach_render(frame->output, false);
+ 	if (frame->cursor_locked) {
+ 		wlr_output_lock_software_cursors(frame->output, false);
+ 	}
+@@ -126,6 +127,7 @@ static void manager_handle_capture_output(struct wl_client *client,
+ 		return;
+ 	}
+ 
++	wlr_output_lock_attach_render(frame->output, true);
+ 	if (overlay_cursor) {
+ 		wlr_output_lock_software_cursors(frame->output, true);
+ 		frame->cursor_locked = true;
+diff --git a/types/wlr_output.c b/types/wlr_output.c
+index dc39d12b1..ab53a6c62 100644
+--- a/types/wlr_output.c
++++ b/types/wlr_output.c
+@@ -493,6 +493,9 @@ bool wlr_output_attach_buffer(struct wlr_output *output,
+ 	if (!output->impl->attach_buffer) {
+ 		return false;
+ 	}
++	if (output->attach_render_locks > 0) {
++		return false;
++	}
+ 
+ 	// If the output has at least one software cursor, refuse to attach the
+ 	// buffer
+@@ -610,6 +613,18 @@ struct wlr_output *wlr_output_from_resource(struct wl_resource *resource) {
+ 	return wl_resource_get_user_data(resource);
+ }
+ 
++void wlr_output_lock_attach_render(struct wlr_output *output, bool lock) {
++	if (lock) {
++		++output->attach_render_locks;
++	} else {
++		assert(output->attach_render_locks > 0);
++		--output->attach_render_locks;
++	}
++	wlr_log(WLR_DEBUG, "%s direct scan-out on output '%s' (locks: %d)",
++		lock ? "Disabling" : "Enabling", output->name,
++		output->attach_render_locks);
++}
++
+ static void output_cursor_damage_whole(struct wlr_output_cursor *cursor);
+ 
+ void wlr_output_lock_software_cursors(struct wlr_output *output, bool lock) {
+diff --git a/types/wlr_screencopy_v1.c b/types/wlr_screencopy_v1.c
+index 42945839c..d6e3938d8 100644
+--- a/types/wlr_screencopy_v1.c
++++ b/types/wlr_screencopy_v1.c
+@@ -23,6 +23,7 @@ static void frame_destroy(struct wlr_screencopy_frame_v1 *frame) {
+ 	if (frame == NULL) {
+ 		return;
+ 	}
++	wlr_output_lock_attach_render(frame->output, false);
+ 	if (frame->cursor_locked) {
+ 		wlr_output_lock_software_cursors(frame->output, false);
+ 	}
+@@ -143,6 +144,7 @@ static void frame_handle_copy(struct wl_client *client,
+ 	output->needs_frame = true;
+ 	wlr_output_schedule_frame(output);
+ 
++	wlr_output_lock_attach_render(output, true);
+ 	if (frame->overlay_cursor) {
+ 		wlr_output_lock_software_cursors(output, true);
+ 		frame->cursor_locked = true;
+
+From c56caf20543d9485b8f2e2a0c4543d327c3c002b Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sat, 25 May 2019 20:13:36 +0300
+Subject: [PATCH 14/16] output-damage: support direct scan-out
+
+In case direct scan-out is used, we still need to accumulate damage for the
+render-buffers.
+---
+ types/wlr_output_damage.c | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/types/wlr_output_damage.c b/types/wlr_output_damage.c
+index a129cec85..fe35b5631 100644
+--- a/types/wlr_output_damage.c
++++ b/types/wlr_output_damage.c
+@@ -59,12 +59,25 @@ static void output_handle_commit(struct wl_listener *listener, void *data) {
+ 		return;
+ 	}
+ 
+-	// same as decrementing, but works on unsigned integers
+-	output_damage->previous_idx += WLR_OUTPUT_DAMAGE_PREVIOUS_LEN - 1;
+-	output_damage->previous_idx %= WLR_OUTPUT_DAMAGE_PREVIOUS_LEN;
++	pixman_region32_t *prev;
++	switch (output_damage->output->pending.buffer_type) {
++	case WLR_OUTPUT_STATE_BUFFER_RENDER:
++		// render-buffers have been swapped, rotate the damage
++
++		// same as decrementing, but works on unsigned integers
++		output_damage->previous_idx += WLR_OUTPUT_DAMAGE_PREVIOUS_LEN - 1;
++		output_damage->previous_idx %= WLR_OUTPUT_DAMAGE_PREVIOUS_LEN;
++
++		prev = &output_damage->previous[output_damage->previous_idx];
++		pixman_region32_copy(prev, &output_damage->current);
++		break;
++	case WLR_OUTPUT_STATE_BUFFER_SCANOUT:
++		// accumulate render-buffer damage
++		prev = &output_damage->previous[output_damage->previous_idx];
++		pixman_region32_union(prev, prev, &output_damage->current);
++		break;
++	}
+ 
+-	pixman_region32_copy(&output_damage->previous[output_damage->previous_idx],
+-		&output_damage->current);
+ 	pixman_region32_clear(&output_damage->current);
+ }
+ 
+
+From e45463a746473e244fa89e0d6635b388f13e8656 Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sun, 26 May 2019 17:38:35 +0300
+Subject: [PATCH 15/16] backend/drm: fallback to drmModeAddFB2
+
+---
+ backend/drm/atomic.c       |  3 ++-
+ backend/drm/drm.c          | 11 +++++++----
+ backend/drm/util.c         | 18 +++++++++++++-----
+ include/backend/drm/drm.h  |  1 +
+ include/backend/drm/util.h |  3 ++-
+ 5 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/backend/drm/atomic.c b/backend/drm/atomic.c
+index c9fb1f450..8ce1e1e6f 100644
+--- a/backend/drm/atomic.c
++++ b/backend/drm/atomic.c
+@@ -172,7 +172,8 @@ static bool atomic_crtc_set_cursor(struct wlr_drm_backend *drm,
+ 	atomic_begin(crtc, &atom);
+ 
+ 	if (bo) {
+-		uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
++		uint32_t fb_id =
++			get_fb_for_bo(bo, plane->drm_format, drm->addfb2_modifiers);
+ 		set_plane_props(&atom, plane, crtc->id, fb_id, false);
+ 	} else {
+ 		atomic_add(&atom, plane->id, plane->props.fb_id, 0);
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 9d1778109..f90890e76 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -66,6 +66,9 @@ bool check_drm_features(struct wlr_drm_backend *drm) {
+ 	int ret = drmGetCap(drm->fd, DRM_CAP_TIMESTAMP_MONOTONIC, &cap);
+ 	drm->clock = (ret == 0 && cap == 1) ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+ 
++	ret = drmGetCap(drm->fd, DRM_CAP_ADDFB2_MODIFIERS, &cap);
++	drm->addfb2_modifiers = ret == 0 && cap == 1;
++
+ 	return true;
+ }
+ 
+@@ -319,7 +322,7 @@ static bool drm_connector_commit(struct wlr_output *output) {
+ 				return false;
+ 			}
+ 		}
+-		fb_id = get_fb_for_bo(bo, plane->drm_format);
++		fb_id = get_fb_for_bo(bo, plane->drm_format, drm->addfb2_modifiers);
+ 		if (fb_id == 0) {
+ 			wlr_log(WLR_ERROR, "get_fb_for_bo failed");
+ 			return false;
+@@ -332,7 +335,7 @@ static bool drm_connector_commit(struct wlr_output *output) {
+ 			return false;
+ 		}
+ 
+-		fb_id = get_fb_for_bo(bo, gbm_bo_get_format(bo));
++		fb_id = get_fb_for_bo(bo, gbm_bo_get_format(bo), drm->addfb2_modifiers);
+ 		if (fb_id == 0) {
+ 			wlr_log(WLR_ERROR, "get_fb_for_bo failed");
+ 			return false;
+@@ -462,7 +465,7 @@ static void drm_connector_start_renderer(struct wlr_drm_connector *conn) {
+ 
+ 	struct gbm_bo *bo = get_drm_surface_front(
+ 		drm->parent ? &plane->mgpu_surf : &plane->surf);
+-	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
++	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format, drm->addfb2_modifiers);
+ 
+ 	struct wlr_drm_mode *mode = (struct wlr_drm_mode *)conn->output.current_mode;
+ 	if (drm->iface->crtc_pageflip(drm, conn, crtc, fb_id, &mode->drm_mode)) {
+@@ -887,7 +890,7 @@ static bool drm_connector_schedule_frame(struct wlr_output *output) {
+ 		return true;
+ 	}
+ 
+-	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
++	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format, drm->addfb2_modifiers);
+ 	if (!drm->iface->crtc_pageflip(drm, conn, crtc, fb_id, NULL)) {
+ 		return false;
+ 	}
+diff --git a/backend/drm/util.c b/backend/drm/util.c
+index 2fa948f59..263f5a925 100644
+--- a/backend/drm/util.c
++++ b/backend/drm/util.c
+@@ -178,7 +178,8 @@ static void free_fb(struct gbm_bo *bo, void *data) {
+ 	}
+ }
+ 
+-uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format) {
++uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format,
++		bool with_modifiers) {
+ 	uint32_t id = (uintptr_t)gbm_bo_get_user_data(bo);
+ 	if (id) {
+ 		return id;
+@@ -192,11 +193,18 @@ uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format) {
+ 	uint32_t handles[4] = {gbm_bo_get_handle(bo).u32};
+ 	uint32_t strides[4] = {gbm_bo_get_stride(bo)};
+ 	uint32_t offsets[4] = {gbm_bo_get_offset(bo, 0)};
+-	uint64_t modifiers[4] = {gbm_bo_get_modifier(bo)};
+ 
+-	if (drmModeAddFB2WithModifiers(fd, width, height, drm_format,
+-			handles, strides, offsets, modifiers, &id, DRM_MODE_FB_MODIFIERS)) {
+-		wlr_log_errno(WLR_ERROR, "Unable to add DRM framebuffer");
++	if (with_modifiers && gbm_bo_get_modifier(bo) != DRM_FORMAT_MOD_INVALID) {
++		uint64_t modifiers[4] = {gbm_bo_get_modifier(bo)};
++		if (drmModeAddFB2WithModifiers(fd, width, height, drm_format, handles,
++				strides, offsets, modifiers, &id, DRM_MODE_FB_MODIFIERS)) {
++			wlr_log_errno(WLR_ERROR, "Unable to add DRM framebuffer");
++		}
++	} else {
++		if (drmModeAddFB2(fd, width, height, drm_format, handles, strides,
++				offsets, &id, 0)) {
++			wlr_log_errno(WLR_ERROR, "Unable to add DRM framebuffer");
++		}
+ 	}
+ 
+ 	gbm_bo_set_user_data(bo, (void *)(uintptr_t)id, free_fb);
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index 3821c3589..991208524 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -72,6 +72,7 @@ struct wlr_drm_backend {
+ 	struct wlr_drm_backend *parent;
+ 	const struct wlr_drm_interface *iface;
+ 	clockid_t clock;
++	bool addfb2_modifiers;
+ 
+ 	int fd;
+ 
+diff --git a/include/backend/drm/util.h b/include/backend/drm/util.h
+index 2491e7036..2d9d11f40 100644
+--- a/include/backend/drm/util.h
++++ b/include/backend/drm/util.h
+@@ -14,7 +14,8 @@ void parse_edid(struct wlr_output *restrict output, size_t len,
+ // Returns the string representation of a DRM output type
+ const char *conn_get_name(uint32_t type_id);
+ // Returns the DRM framebuffer id for a gbm_bo
+-uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format);
++uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format,
++	bool with_modifiers);
+ 
+ // Part of match_obj
+ enum {
+
+From 85a4c54c770e429cf10c9c0ceba5f3ffe03ee21a Mon Sep 17 00:00:00 2001
+From: Simon Ser <contact@emersion.fr>
+Date: Sun, 26 May 2019 17:45:21 +0300
+Subject: [PATCH 16/16] backend/drm: add support for multiplanar BOs
+
+---
+ backend/drm/util.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/backend/drm/util.c b/backend/drm/util.c
+index 263f5a925..5d4d7ae1b 100644
+--- a/backend/drm/util.c
++++ b/backend/drm/util.c
+@@ -190,12 +190,20 @@ uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format,
+ 	int fd = gbm_device_get_fd(gbm);
+ 	uint32_t width = gbm_bo_get_width(bo);
+ 	uint32_t height = gbm_bo_get_height(bo);
+-	uint32_t handles[4] = {gbm_bo_get_handle(bo).u32};
+-	uint32_t strides[4] = {gbm_bo_get_stride(bo)};
+-	uint32_t offsets[4] = {gbm_bo_get_offset(bo, 0)};
++
++	uint32_t handles[4] = {0};
++	uint32_t strides[4] = {0};
++	uint32_t offsets[4] = {0};
++	uint64_t modifiers[4] = {0};
++	for (int i = 0; i < gbm_bo_get_plane_count(bo); i++) {
++		handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
++		strides[i] = gbm_bo_get_stride_for_plane(bo, i);
++		offsets[i] = gbm_bo_get_offset(bo, i);
++		// KMS requires all BO planes to have the same modifier
++		modifiers[i] = gbm_bo_get_modifier(bo);
++	}
+ 
+ 	if (with_modifiers && gbm_bo_get_modifier(bo) != DRM_FORMAT_MOD_INVALID) {
+-		uint64_t modifiers[4] = {gbm_bo_get_modifier(bo)};
+ 		if (drmModeAddFB2WithModifiers(fd, width, height, drm_format, handles,
+ 				strides, offsets, modifiers, &id, DRM_MODE_FB_MODIFIERS)) {
+ 			wlr_log_errno(WLR_ERROR, "Unable to add DRM framebuffer");

@@ -30,7 +30,6 @@ Packages from this overlay are regularly updated and built against `nixos-unstab
 | pkgs/sway | [2019-06-04 05:47](https://github.com/swaywm/sway/commits/799f5a2cd5ffa83d73816489aa8683564bc226f7) |
 | pkgs/swaybg | [2019-05-04 12:08](https://github.com/swaywm/swaybg/commits/25c6eaf15e64655385f01cbb98bffe28a862fe13) |
 | pkgs/swayidle | [2019-05-23 13:10](https://github.com/swaywm/swayidle/commits/5e7bd5bd21010cb5723acdf449edb341e9880ae2) |
-| pkgs/swaybg | [2019-05-04 12:08](https://github.com/swaywm/swaybg/commits/25c6eaf15e64655385f01cbb98bffe28a862fe13) |
 | pkgs/swaylock | [2019-05-23 06:43](https://github.com/swaywm/swaylock/commits/a9b274eb6c63397273515151324add022a3db2a9) |
 | pkgs/waybar | [2019-06-04 15:34](https://github.com/Alexays/waybar/commits/1962caf144ebd1d8772ffa0b77630ea48e61e615) |
 | pkgs/waybox | [2018-11-27 14:44](https://github.com/wizbright/waybox/commits/482d0a92f5530a5cbab8b0b913b653d4503015c4) |

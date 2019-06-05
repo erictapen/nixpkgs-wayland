@@ -25,7 +25,8 @@ in stdenv.mkDerivation rec {
 
   nativeBuildInputs = [ meson ninja pkgconfig ];
 
-  patches = [ ./wlroots-pr-1715.patch ];
+  #patches = [ ./wlroots-pr-1715.patch ];
+  patches = [ ./wlroots-pr-1641.patch ];
 
   buildInputs = [
     wayland libGL wayland-protocols libinput libxkbcommon pixman
