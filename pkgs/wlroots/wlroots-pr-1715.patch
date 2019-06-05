@@ -1,0 +1,185 @@
+From 993631213d8298414ed22a827f664cba7e909155 Mon Sep 17 00:00:00 2001
+From: Scott Anderson <scott@anderso.nz>
+Date: Wed, 5 Jun 2019 16:40:06 +1200
+Subject: [PATCH] Add support for drmModeAddFB2WithModifiers
+
+---
+ backend/drm/atomic.c       |  2 +-
+ backend/drm/drm.c          | 13 +++++++----
+ backend/drm/util.c         | 44 ++++++++++++++++++++++++++++++--------
+ include/backend/drm/drm.h  |  1 +
+ include/backend/drm/util.h |  8 +++++--
+ 5 files changed, 52 insertions(+), 16 deletions(-)
+
+diff --git a/backend/drm/atomic.c b/backend/drm/atomic.c
+index c9fb1f450..2a7108908 100644
+--- a/backend/drm/atomic.c
++++ b/backend/drm/atomic.c
+@@ -172,7 +172,7 @@ static bool atomic_crtc_set_cursor(struct wlr_drm_backend *drm,
+ 	atomic_begin(crtc, &atom);
+ 
+ 	if (bo) {
+-		uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
++		uint32_t fb_id = get_fb_for_bo(drm, bo, plane->drm_format);
+ 		set_plane_props(&atom, plane, crtc->id, fb_id, false);
+ 	} else {
+ 		atomic_add(&atom, plane->id, plane->props.fb_id, 0);
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 17a2e48db..4699d2df7 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -63,7 +63,12 @@ bool check_drm_features(struct wlr_drm_backend *drm) {
+ 		drm->iface = &atomic_iface;
+ 	}
+ 
+-	int ret = drmGetCap(drm->fd, DRM_CAP_TIMESTAMP_MONOTONIC, &cap);
++	int ret;
++
++	ret = drmGetCap(drm->fd, DRM_CAP_ADDFB2_MODIFIERS, &cap);
++	drm->has_modifiers = ret == 0 ? cap : 0;
++
++	ret = drmGetCap(drm->fd, DRM_CAP_TIMESTAMP_MONOTONIC, &cap);
+ 	drm->clock = (ret == 0 && cap == 1) ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+ 
+ 	return true;
+@@ -266,7 +271,7 @@ static bool drm_connector_commit(struct wlr_output *output) {
+ 	if (drm->parent) {
+ 		bo = copy_drm_surface_mgpu(&plane->mgpu_surf, bo);
+ 	}
+-	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
++	uint32_t fb_id = get_fb_for_bo(drm, bo, plane->drm_format);
+ 
+ 	if (conn->pageflip_pending) {
+ 		wlr_log(WLR_ERROR, "Skipping pageflip on output '%s'", conn->output.name);
+@@ -385,7 +390,7 @@ static void drm_connector_start_renderer(struct wlr_drm_connector *conn) {
+ 
+ 	struct gbm_bo *bo = get_drm_surface_front(
+ 		drm->parent ? &plane->mgpu_surf : &plane->surf);
+-	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
++	uint32_t fb_id = get_fb_for_bo(drm, bo, plane->drm_format);
+ 
+ 	struct wlr_drm_mode *mode = (struct wlr_drm_mode *)conn->output.current_mode;
+ 	if (drm->iface->crtc_pageflip(drm, conn, crtc, fb_id, &mode->drm_mode)) {
+@@ -810,7 +815,7 @@ static bool drm_connector_schedule_frame(struct wlr_output *output) {
+ 		return true;
+ 	}
+ 
+-	uint32_t fb_id = get_fb_for_bo(bo, plane->drm_format);
++	uint32_t fb_id = get_fb_for_bo(drm, bo, plane->drm_format);
+ 	if (!drm->iface->crtc_pageflip(drm, conn, crtc, fb_id, NULL)) {
+ 		return false;
+ 	}
+diff --git a/backend/drm/util.c b/backend/drm/util.c
+index c2aa0fd8a..74574471a 100644
+--- a/backend/drm/util.c
++++ b/backend/drm/util.c
+@@ -6,6 +6,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <wlr/util/log.h>
++#include "backend/drm/drm.h"
+ #include "backend/drm/util.h"
+ 
+ int32_t calculate_refresh_rate(const drmModeModeInfo *mode) {
+@@ -178,7 +179,8 @@ static void free_fb(struct gbm_bo *bo, void *data) {
+ 	}
+ }
+ 
+-uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format) {
++uint32_t get_fb_for_bo(struct wlr_drm_backend *drm,
++		struct gbm_bo *bo, uint32_t drm_format) {
+ 	uint32_t id = (uintptr_t)gbm_bo_get_user_data(bo);
+ 	if (id) {
+ 		return id;
+@@ -188,17 +190,41 @@ uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format) {
+ 	assert(drm_format == DRM_FORMAT_ARGB8888 ||
+ 		drm_format == DRM_FORMAT_XRGB8888);
+ 
+-	struct gbm_device *gbm = gbm_bo_get_device(bo);
+-
+-	int fd = gbm_device_get_fd(gbm);
+ 	uint32_t width = gbm_bo_get_width(bo);
+ 	uint32_t height = gbm_bo_get_height(bo);
+-	uint32_t handles[4] = {gbm_bo_get_handle(bo).u32};
+-	uint32_t pitches[4] = {gbm_bo_get_stride(bo)};
+-	uint32_t offsets[4] = {gbm_bo_get_offset(bo, 0)};
++	uint32_t handles[4];
++	uint32_t pitches[4];
++	uint32_t offsets[4];
++	uint64_t modifiers[4];
++	uint64_t mod = gbm_bo_get_modifier(bo);
++
++	int i, n = gbm_bo_get_plane_count(bo);
++	for (i = 0; i < n; ++i) {
++		handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
++		pitches[i] = gbm_bo_get_stride_for_plane(bo, i);
++		offsets[i] = gbm_bo_get_offset(bo, i);
++		modifiers[i] = mod;
++	}
++	for (; i < 4; ++i) {
++		handles[i] = 0;
++		pitches[i] = 0;
++		offsets[i] = 0;
++		modifiers[i] = DRM_FORMAT_MOD_INVALID;
++	}
++
++	int ret = 1;
++	if (drm->has_modifiers && mod != DRM_FORMAT_MOD_INVALID) {
++		ret = drmModeAddFB2WithModifiers(drm->fd, width, height, drm_format,
++			handles, pitches, offsets, modifiers, &id, DRM_MODE_FB_MODIFIERS);
++	}
++
++	/* Try again without modifiers to see if it ends up working */
++	if (ret) {
++		ret = drmModeAddFB2(drm->fd, width, height, drm_format,
++			handles, pitches, offsets, &id, 0);
++	}
+ 
+-	if (drmModeAddFB2(fd, width, height, drm_format,
+-			handles, pitches, offsets, &id, 0)) {
++	if (ret) {
+ 		wlr_log_errno(WLR_ERROR, "Unable to add DRM framebuffer");
+ 	}
+ 
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index 6481f0851..ce6ce9b4a 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -70,6 +70,7 @@ struct wlr_drm_backend {
+ 	struct wlr_drm_backend *parent;
+ 	const struct wlr_drm_interface *iface;
+ 	clockid_t clock;
++	bool has_modifiers;
+ 
+ 	int fd;
+ 
+diff --git a/include/backend/drm/util.h b/include/backend/drm/util.h
+index 2491e7036..a2ff7c686 100644
+--- a/include/backend/drm/util.h
++++ b/include/backend/drm/util.h
+@@ -1,11 +1,14 @@
+ #ifndef BACKEND_DRM_UTIL_H
+ #define BACKEND_DRM_UTIL_H
+ 
++#include <gbm.h>
+ #include <stdint.h>
+-#include <wlr/types/wlr_output.h>
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+ 
++struct wlr_output;
++struct wlr_drm_backend;
++
+ // Calculates a more accurate refresh rate (mHz) than what mode itself provides
+ int32_t calculate_refresh_rate(const drmModeModeInfo *mode);
+ // Populates the make/model/phys_{width,height} of output from the edid data
+@@ -14,7 +17,8 @@ void parse_edid(struct wlr_output *restrict output, size_t len,
+ // Returns the string representation of a DRM output type
+ const char *conn_get_name(uint32_t type_id);
+ // Returns the DRM framebuffer id for a gbm_bo
+-uint32_t get_fb_for_bo(struct gbm_bo *bo, uint32_t drm_format);
++uint32_t get_fb_for_bo(struct wlr_drm_backend *drm,
++	struct gbm_bo *bo, uint32_t drm_format);
+ 
+ // Part of match_obj
+ enum {
