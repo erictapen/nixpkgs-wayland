@@ -26,8 +26,8 @@ waylandPkgs = rec {
   gebaar-libinput  = pkgs.callPackage ./pkgs/gebaar-libinput {};
   i3status-rust    = pkgs.callPackage ./pkgs/i3status-rust {};
 
-  #bspwc    = pkgs.callPackage ./pkgs/bspwc { wlroots = pkgs.wlroots; };
-  #wltrunk  = pkgs.callPackage ./pkgs/wltrunk { wlroots = pkgs.wlroots; };
+  bspwc    = pkgs.callPackage ./pkgs/bspwc { wlroots = pkgs.wlroots; };
+  wltrunk  = pkgs.callPackage ./pkgs/wltrunk { wlroots = pkgs.wlroots; };
   glpaper  = pkgs.callPackage ./pkgs/glpaper {};
   waypipe  = pkgs.callPackage ./pkgs/waypipe {};
 
